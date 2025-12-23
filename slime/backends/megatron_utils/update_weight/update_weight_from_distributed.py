@@ -9,9 +9,10 @@ import torch.distributed as dist
 from megatron.core import mpu
 from ray import ObjectRef
 from ray.actor import ActorHandle
-from tqdm import tqdm
 
 from slime.utils.distributed_utils import get_gloo_group, init_process_group
+from slime.utils.ipv6_utils import format_tcp_init_method
+from tqdm import tqdm
 
 from ..megatron_to_hf import convert_to_hf
 from .common import all_gather_param, named_params_and_buffers
@@ -55,7 +56,8 @@ class UpdateWeightFromDistributed:
         #   1. AllGather parameters to rank 0
         #   2. Broadcast parameters from rank 0 to all sglang engines
         self._is_pp_src_rank = (
-            mpu.get_data_parallel_rank(with_context_parallel=True) == 0 and mpu.get_tensor_model_parallel_rank() == 0
+            mpu.get_data_parallel_rank(with_context_parallel=True) == 0
+            and mpu.get_tensor_model_parallel_rank() == 0
         )
         pp_rank = mpu.get_pipeline_model_parallel_rank()
         if self._is_pp_src_rank:
@@ -64,7 +66,10 @@ class UpdateWeightFromDistributed:
         if self._is_pp_src_rank:
             if self._model_update_groups is not None:
                 disconnect_rollout_engines_from_distributed(
-                    self.args, self._group_name, self._model_update_groups, self.rollout_engines
+                    self.args,
+                    self._group_name,
+                    self._model_update_groups,
+                    self.rollout_engines,
                 )
             self._model_update_groups = connect_rollout_engines_from_distributed(
                 self.args, self._group_name, rollout_engines
@@ -78,14 +83,20 @@ class UpdateWeightFromDistributed:
         self.weight_version += 1
 
         if dist.get_rank() == 0:
-            ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
+            ray.get(
+                [engine.pause_generation.remote() for engine in self.rollout_engines]
+            )
             ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         buffer_size = 0
         converted_named_tensors = []
         # non expert params
-        pbar = tqdm(desc=f"[{self._group_name}] Update weights", total=0) if self._is_pp_src_rank else None
+        pbar = (
+            tqdm(desc=f"[{self._group_name}] Update weights", total=0)
+            if self._is_pp_src_rank
+            else None
+        )
 
         for name, param in named_params_and_buffers(self.args, self.model):
             if ".experts." in name:
@@ -95,7 +106,9 @@ class UpdateWeightFromDistributed:
             )
 
         if converted_named_tensors:
-            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+            self._update_bucket_weights_from_distributed(
+                converted_named_tensors, pbar=pbar
+            )
 
         dist.barrier(group=get_gloo_group())
 
@@ -109,11 +122,15 @@ class UpdateWeightFromDistributed:
             )
 
         if named_tensors:
-            self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
+            self._update_expert_bucket_weights_from_distributed(
+                named_tensors, pbar=pbar
+            )
 
         dist.barrier(group=get_gloo_group())
         if dist.get_rank() == 0:
-            ray.get([engine.continue_generation.remote() for engine in self.rollout_engines])
+            ray.get(
+                [engine.continue_generation.remote() for engine in self.rollout_engines]
+            )
         dist.barrier(group=get_gloo_group())
 
     def _update_weight_from_distributed(
@@ -134,9 +151,13 @@ class UpdateWeightFromDistributed:
 
         param_size = param.numel() * param.element_size()
         if buffer_size + param_size > self.args.update_weight_buffer_size:
-            self._update_bucket_weights_from_distributed(converted_named_tensors, pbar=pbar)
+            self._update_bucket_weights_from_distributed(
+                converted_named_tensors, pbar=pbar
+            )
             buffer_size = 0
-        converted_named_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+        converted_named_tensors += convert_to_hf(
+            self.args, self.model_name, name, param, self.quantization_config
+        )
         buffer_size += param_size
         return buffer_size
 
@@ -157,7 +178,9 @@ class UpdateWeightFromDistributed:
         if (
             buffer_size + param_size
         ) * mpu.get_expert_model_parallel_world_size() > self.args.update_weight_buffer_size:
-            self._update_expert_bucket_weights_from_distributed(named_tensors, pbar=pbar)
+            self._update_expert_bucket_weights_from_distributed(
+                named_tensors, pbar=pbar
+            )
             buffer_size = 0
 
         named_tensors.append((name, param))
@@ -172,19 +195,30 @@ class UpdateWeightFromDistributed:
         """
         names = [name for name, _ in named_tensors]
         all_names = [None] * mpu.get_expert_model_parallel_world_size()
-        dist.all_gather_object(all_names, names, group=mpu.get_expert_model_parallel_group())
+        dist.all_gather_object(
+            all_names, names, group=mpu.get_expert_model_parallel_group()
+        )
 
         for names in all_names:
-            assert len(named_tensors) == len(names), f"mismatch names length: {len(named_tensors)} != {len(names)}"
+            assert len(named_tensors) == len(
+                names
+            ), f"mismatch names length: {len(named_tensors)} != {len(names)}"
 
-        all_gathered_params = [[] for _ in range(mpu.get_expert_model_parallel_world_size())]
+        all_gathered_params = [
+            [] for _ in range(mpu.get_expert_model_parallel_world_size())
+        ]
         handles = []
         for i, (_name, param) in enumerate(named_tensors):
             params = [
                 torch.empty_like(param.data, device=torch.cuda.current_device())
                 for _ in range(mpu.get_expert_model_parallel_world_size())
             ]
-            handle = dist.all_gather(params, param.data, group=mpu.get_expert_model_parallel_group(), async_op=True)
+            handle = dist.all_gather(
+                params,
+                param.data,
+                group=mpu.get_expert_model_parallel_group(),
+                async_op=True,
+            )
             handles.append(handle)
             for ep_rank, names in enumerate(all_names):
                 all_gathered_params[ep_rank].append((names[i], params[ep_rank]))
@@ -198,12 +232,16 @@ class UpdateWeightFromDistributed:
         all_gathered_params = sum(all_gathered_params, [])
         converted_hf_tensors = []
         for name, param in all_gathered_params:
-            converted_hf_tensors += convert_to_hf(self.args, self.model_name, name, param, self.quantization_config)
+            converted_hf_tensors += convert_to_hf(
+                self.args, self.model_name, name, param, self.quantization_config
+            )
 
         self._update_bucket_weights_from_distributed(converted_hf_tensors, pbar)
 
     def _update_bucket_weights_from_distributed(
-        self, converted_named_tensors: list[tuple[str, torch.Tensor]], pbar: tqdm | None = None
+        self,
+        converted_named_tensors: list[tuple[str, torch.Tensor]],
+        pbar: tqdm | None = None,
     ) -> None:
         """
         Lock → broadcast → clear → unlock → pbar++. Lock prevents NCCL deadlock.
@@ -251,7 +289,7 @@ def connect_rollout_engines_from_distributed(
     ]
     model_update_groups = init_process_group(
         backend="nccl",
-        init_method=f"tcp://{master_address}:{master_port}",
+        init_method=format_tcp_init_method(master_address, master_port),
         world_size=world_size,
         rank=0,
         group_name=group_name,
@@ -260,11 +298,16 @@ def connect_rollout_engines_from_distributed(
     return model_update_groups
 
 
-def disconnect_rollout_engines_from_distributed(args, group_name, model_update_groups, rollout_engines):
+def disconnect_rollout_engines_from_distributed(
+    args, group_name, model_update_groups, rollout_engines
+):
     """
     Destroy NCCL on training and engines.
     """
-    refs = [engine.destroy_weights_update_group.remote(group_name) for engine in rollout_engines]
+    refs = [
+        engine.destroy_weights_update_group.remote(group_name)
+        for engine in rollout_engines
+    ]
     dist.destroy_process_group(model_update_groups)
     ray.get(refs)
 
